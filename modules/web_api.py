@@ -54,6 +54,8 @@ from modules.auth import load_auth_settings
 from modules.auth import save_auth_settings
 from modules.auth import verify_api_key
 from modules.config import Config
+from modules.plan import service as plan_service
+from modules.plan.store import PlanStore
 from modules.scheduler import Scheduler
 from modules.util import YAML
 from modules.util import EnvStr
@@ -82,6 +84,21 @@ class CommandRequest(BaseModel):
     skip_cleanup: bool = False
     skip_qb_version_check: bool = False
     log_level: Optional[str] = None
+
+
+class PlanCreateRequest(BaseModel):
+    """Create a persisted execution plan from a preview run."""
+
+    config_file: str = "config.yml"
+    commands: list[str]
+    hashes: list[str] = field(default_factory=list)
+    log_level: Optional[str] = None
+
+
+class PlanConfirmRequest(BaseModel):
+    """Confirm a plan, optionally skipping specific pending actions."""
+
+    skip_ids: list[str] = field(default_factory=list)
 
 
 class ConfigRequest(BaseModel):
@@ -163,9 +180,9 @@ async def process_queue_periodically(web_api: WebAPI) -> None:
                 try:
                     while not web_api.web_api_queue.empty():
                         try:
-                            request = web_api.web_api_queue.get_nowait()
+                            job = web_api.web_api_queue.get_nowait()
                             try:
-                                await web_api._execute_command(request)
+                                await web_api._run_queued_job(job)
                                 logger.info("Successfully processed queued request")
                             except Exception as e:
                                 logger.error(f"Error processing queued request: {str(e)}")
@@ -306,6 +323,15 @@ class WebAPI:
 
         # Define all API routes on the router
         api_router.post("/run-command")(self.run_command)
+
+        # Persistent execution plan routes
+        api_router.post("/plans")(self.create_plan)
+        api_router.get("/plans")(self.list_plans)
+        api_router.get("/plans/{plan_id}")(self.get_plan)
+        api_router.post("/plans/{plan_id}/confirm")(self.confirm_plan)
+        api_router.post("/plans/{plan_id}/resume")(self.resume_plan)
+        api_router.post("/plans/{plan_id}/actions/{action_id}/skip")(self.skip_plan_action)
+        api_router.delete("/plans/{plan_id}")(self.delete_plan)
 
         # Configuration management routes
         api_router.get("/configs")(self.list_configs)
@@ -1046,7 +1072,13 @@ class WebAPI:
 
     async def run_command(self, request: CommandRequest) -> dict:
         """Handle incoming command requests."""
-        # Use atomic check-and-set operation
+        return await self._submit_job(
+            ("command", request), lambda: self._execute_command(request), f"run:{request.config_file}"
+        )
+
+    async def _submit_job(self, job: tuple, runner, label: str) -> dict:
+        """Run *runner* under the global is_running lock, or queue *job* when busy."""
+        queued_payload = {"status": "queued", "message": "Another run is in progress. Request queued.", "job": label}
         try:
             if self.is_running_lock.acquire(timeout=0.1):
                 try:
@@ -1059,71 +1091,193 @@ class WebAPI:
                         ):
                             logger.warning("Previous run appears to be stuck. Forcing reset of is_running flag.")
                             self.is_running.value = False
-                            object.__setattr__(self, "_last_run_start", None)  # Clear the stuck timestamp
+                            object.__setattr__(self, "_last_run_start", None)
                         else:
                             logger.info("Another run is in progress. Queuing web API request...")
-                            self.web_api_queue.put(request)
-                            return {
-                                "status": "queued",
-                                "message": "Another run is in progress. Request queued.",
-                                "config_file": request.config_file,
-                                "commands": request.commands,
-                            }
-                    # Atomic operation: set flag to True
+                            self.web_api_queue.put(job)
+                            return queued_payload
                     self.is_running.value = True
-                    object.__setattr__(self, "_last_run_start", datetime.now())  # Track when this run started
+                    object.__setattr__(self, "_last_run_start", datetime.now())
                 finally:
-                    # Release lock immediately after atomic operation
                     self.is_running_lock.release()
             else:
-                # If we can't acquire the lock quickly, assume another run is in progress
-                self.web_api_queue.put(request)
-                return {
-                    "status": "queued",
-                    "message": "Another run is in progress. Request queued.",
-                    "config_file": request.config_file,
-                    "commands": request.commands,
-                }
+                self.web_api_queue.put(job)
+                return queued_payload
         except Exception as e:
             logger.error(f"Error acquiring lock: {str(e)}")
-            # Reset is_running flag if it was set before the error occurred
             try:
                 with self.is_running_lock:
                     self.is_running.value = False
             except Exception:
-                # If we can't acquire the lock to reset, log it but continue
-                logger.warning("Could not acquire lock to reset is_running flag after error")
-            # If there's any error with locking, queue the request as a safety measure
-            self.web_api_queue.put(request)
-            return {
-                "status": "queued",
-                "message": "Lock error occurred. Request queued.",
-                "config_file": request.config_file,
-                "commands": request.commands,
-            }
+                logger.warning("Could not acquire lock to reset is_running state after error")
+            self.web_api_queue.put(job)
+            return {"status": "queued", "message": "Lock error occurred. Request queued.", "job": label}
 
-        # Execute the command outside the lock
         try:
-            result = await self._execute_command(request)
-            # Ensure is_running is reset after successful execution
+            return await runner()
+        finally:
             with self.is_running_lock:
                 self.is_running.value = False
-                object.__setattr__(self, "_last_run_start", None)  # Clear the timestamp
-            return result
-        except HTTPException as e:
-            # Ensure is_running is reset if an HTTPException occurs
-            with self.is_running_lock:
-                self.is_running.value = False
-                object.__setattr__(self, "_last_run_start", None)  # Clear the timestamp
-            raise e
+                object.__setattr__(self, "_last_run_start", None)
+
+    async def _run_queued_job(self, job: tuple) -> None:
+        kind = job[0]
+        if kind == "command":
+            await self._execute_command(job[1])
+        elif kind == "plan_create":
+            await self._execute_plan_create(job[1])
+        elif kind == "plan_confirm":
+            await self._execute_plan_confirm(job[1], job[2])
+        elif kind == "plan_resume":
+            await self._execute_plan_resume(job[1])
+        else:
+            logger.error(f"Unknown queued job kind: {kind}")
+
+    # ---- execution plans ----------------------------------------------------
+
+    def _plan_store(self) -> PlanStore:
+        return PlanStore(self.default_dir)
+
+    def _plan_run_args(self, plan: dict):
+        return plan_service.build_run_args(
+            self.args,
+            config_file=plan["config_file"],
+            commands=list(plan.get("commands", [])),
+            hashes=list(plan.get("hashes", [])),
+            dry_run=True,
+        )
+
+    async def create_plan(self, request: PlanCreateRequest) -> dict:
+        return await self._submit_job(
+            ("plan_create", request), lambda: self._execute_plan_create(request), f"plan_create:{request.config_file}"
+        )
+
+    async def _execute_plan_create(self, request: PlanCreateRequest) -> dict:
+        original_log_level = logger.get_level()
+        try:
+            if request.log_level:
+                logger.set_level(request.log_level)
+            try:
+                config_files = get_matching_config_files(request.config_file, self.default_dir)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            now = datetime.now()
+            plans = []
+            for config_file in config_files:
+                run_args = plan_service.build_run_args(
+                    self.args,
+                    config_file=config_file,
+                    commands=request.commands,
+                    hashes=request.hashes,
+                    dry_run=True,
+                    now=now,
+                )
+                config_base = os.path.splitext(config_file)[0]
+                logger.add_config_handler(config_base)
+                try:
+                    plan = plan_service.create_plan_for_config(
+                        self.default_dir, run_args, config_file, request.commands, request.hashes
+                    )
+                    plans.append(PlanStore.summary(plan))
+                finally:
+                    logger.remove_config_handler(config_base)
+            return {"status": "success", "plans": plans}
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
-            # Ensure is_running is reset if any other exception occurs
-            with self.is_running_lock:
-                self.is_running.value = False
-                object.__setattr__(self, "_last_run_start", None)  # Clear the timestamp
             logger.stacktrace()
-            logger.error(f"Error in run_command during execution: {str(e)}")
+            logger.error(f"Error creating execution plan: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            if logger.get_level() != original_log_level:
+                logger.set_level(logging.getLevelName(original_log_level))
+
+    async def list_plans(self) -> dict:
+        return {"plans": self._plan_store().list_plans()}
+
+    async def get_plan(self, plan_id: str, validate: bool = False) -> dict:
+        plan = self._plan_store().load(plan_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail=f"Plan {plan_id} not found")
+        if not validate:
+            return plan_service.check_plan(self.default_dir, {}, plan, connect=False)
+        try:
+            run_args = self._plan_run_args(plan)
+            return plan_service.check_plan(self.default_dir, run_args, plan, connect=True)
+        except Exception as e:
+            logger.stacktrace()
+            raise HTTPException(status_code=500, detail=f"Plan validation failed: {e}")
+
+    async def confirm_plan(self, plan_id: str, request: PlanConfirmRequest) -> dict:
+        skip_ids = list(request.skip_ids)
+        return await self._submit_job(
+            ("plan_confirm", plan_id, skip_ids),
+            lambda: self._execute_plan_confirm(plan_id, skip_ids),
+            f"plan_confirm:{plan_id}",
+        )
+
+    async def _execute_plan_confirm(self, plan_id: str, skip_ids: list[str]) -> dict:
+        store = self._plan_store()
+        plan = store.load(plan_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail=f"Plan {plan_id} not found")
+        if plan.get("status") == "invalid":
+            raise HTTPException(status_code=409, detail="Plan is invalid; create a new preview")
+        try:
+            run_args = self._plan_run_args(plan)
+            result = plan_service.apply_plan(self.default_dir, run_args, plan, set(skip_ids))
+            return {"status": "success", "plan": PlanStore.summary(result), "summary": result["summary"]}
+        except plan_service.PlanInvalid as e:
+            raise HTTPException(status_code=409, detail=e.reasons)
+        except Exception as e:
+            logger.stacktrace()
+            logger.error(f"Error confirming execution plan {plan_id}: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def resume_plan(self, plan_id: str) -> dict:
+        return await self._submit_job(
+            ("plan_resume", plan_id), lambda: self._execute_plan_resume(plan_id), f"plan_resume:{plan_id}"
+        )
+
+    async def _execute_plan_resume(self, plan_id: str) -> dict:
+        store = self._plan_store()
+        plan = store.load(plan_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail=f"Plan {plan_id} not found")
+        pending = [a for a in plan.get("actions", []) if a.get("result") == "pending"]
+        if not pending and plan.get("status") in ("completed", "completed_with_failures"):
+            return {"status": "success", "plan": PlanStore.summary(plan), "summary": plan.get("summary", {})}
+        try:
+            run_args = self._plan_run_args(plan)
+            result = plan_service.apply_plan(self.default_dir, run_args, plan)
+            return {"status": "success", "plan": PlanStore.summary(result), "summary": result["summary"]}
+        except plan_service.PlanInvalid as e:
+            raise HTTPException(status_code=409, detail=e.reasons)
+        except Exception as e:
+            logger.stacktrace()
+            logger.error(f"Error resuming execution plan {plan_id}: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def skip_plan_action(self, plan_id: str, action_id: str) -> dict:
+        try:
+            plan = plan_service.skip_action(self.default_dir, plan_id, action_id)
+            return {"status": "success", "plan": PlanStore.summary(plan)}
+        except FileNotFoundError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except plan_service.PlanInvalid as e:
+            raise HTTPException(status_code=409, detail=e.reasons)
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+
+    async def delete_plan(self, plan_id: str) -> dict:
+        store = self._plan_store()
+        plan = store.load(plan_id)
+        if plan is None:
+            raise HTTPException(status_code=404, detail=f"Plan {plan_id} not found")
+        if plan.get("status") == "running":
+            raise HTTPException(status_code=409, detail="Cannot delete a running plan; resume or wait for it to finish")
+        store.delete(plan_id)
+        return {"status": "success", "deleted": plan_id}
 
     def force_reset_running_state(self) -> dict[str, Any]:
         """Force reset the is_running state. Use this to recover from stuck states."""

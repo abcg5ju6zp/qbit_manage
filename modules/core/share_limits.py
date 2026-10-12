@@ -41,6 +41,8 @@ class ShareLimits:
         # tag for last active
         self.last_active_tag = qbit_manager.config.share_limits_last_active_tag
         self.group_tag = None  # tag for the share limit group
+        if self.config.plan:
+            self.config.plan.set_context("share_limits")
 
         self.update_share_limits()
         self.delete_share_limits_suffix_tag()
@@ -111,6 +113,11 @@ class ShareLimits:
             t_status = self.qbt.torrentinfo[t_name]["status"]
             # Double check that the content path is the same before we delete anything
             if util.path_replace(torrent["content_path"], self.root_dir, self.remote_dir) == torrent_dict["content_path"]:
+                if self.config.plan:
+                    self.config.plan.set_reason(
+                        f"Share limit reached, cleanup enabled for group {group_name}: "
+                        f"{' '.join(str(torrent_dict['body']).split())}"
+                    )
                 tracker = self.qbt.get_tags(self.qbt.get_tracker_urls(torrent.trackers))
                 body = []
                 body += logger.print_line(logger.insert_space(f"Torrent Name: {t_name}", 3), self.config.loglevel)
@@ -413,15 +420,21 @@ class ShareLimits:
             # Remove previous share_limits tag
             tag = is_tag_in_torrent(self.share_limits_tag, torrent.tags, exact=False)
             if tag:
+                if self.config.plan:
+                    self.config.plan.set_reason(f"Replace previous share limits tag '{tag}' with group tag")
                 torrent.remove_tags(tag)
                 tags_changed = True
             # Check if any of the previous share limits custom tags are there
             for custom_tag in self.share_limits_custom_tags:
                 if is_tag_in_torrent(custom_tag, torrent.tags):
+                    if self.config.plan:
+                        self.config.plan.set_reason(f"Remove obsolete share limits group tag '{custom_tag}'")
                     torrent.remove_tags(custom_tag)
                     tags_changed = True
             # Will tag the torrent with the group name if add_group_to_tag is True
             if self.group_tag:
+                if self.config.plan:
+                    self.config.plan.set_reason(f"Assign share limits group tag {self.group_tag}")
                 torrent.add_tags(self.group_tag)
                 tags_changed = True
         return tags_changed
@@ -479,6 +492,10 @@ class ShareLimits:
                         self.config.loglevel,
                     )
                     # Clear share limits to prevent qBittorrent from pausing again, then apply throttle
+                    if self.config.plan:
+                        self.config.plan.set_reason(
+                            f"Share limit reached; keep seeding with upload throttle {disp}"
+                        )
                     if not self.config.dry_run:
                         # Allow continued seeding by removing share limits
                         torrent.set_share_limits(
@@ -499,6 +516,8 @@ class ShareLimits:
 
         # Resume torrent if it was paused now that the share limit has changed
         if torrent.state_enum.is_complete and group_config["resume_torrent_after_change"]:
+            if self.config.plan:
+                self.config.plan.set_reason("Resume torrent after applying new share limits")
             if not self.config.dry_run:
                 torrent.resume()
 
@@ -665,12 +684,17 @@ class ShareLimits:
                 return []
             if is_tag_in_torrent(self.last_active_tag, torrent.tags):
                 return []
+            limit_reason = "; ".join(m.strip() for m in body) or "Apply configured share limits"
             torrent_upload_limit = -1 if round(torrent.up_limit / 1024) == 0 else round(torrent.up_limit / 1024)
             if limit_upload_speed is not None and limit_upload_speed != torrent_upload_limit:
+                if self.config.plan:
+                    self.config.plan.set_reason(limit_reason)
                 if limit_upload_speed == -1:
                     torrent.set_upload_limit(-1)
                 else:
                     torrent.set_upload_limit(limit_upload_speed * 1024)
+            if self.config.plan:
+                self.config.plan.set_reason(limit_reason)
             torrent.set_share_limits(
                 ratio_limit=max_ratio,
                 seeding_time_limit=max_seeding_time,
@@ -707,6 +731,8 @@ class ShareLimits:
         def _remove_tag(tag):
             nonlocal torrent_tags
             if is_tag_in_torrent(tag, torrent_tags):
+                if self.config.plan:
+                    self.config.plan.set_reason(f"Exclusion condition cleared; remove tag {tag}")
                 if not self.config.dry_run:
                     torrent.remove_tags(tags=tag)
 
@@ -718,6 +744,8 @@ class ShareLimits:
                 logger.print_line(logger.insert_space(f"Tracker: {tracker}", 8), self.config.loglevel)
                 logger.print_line(logger.insert_space(reason_msg, 8), self.config.loglevel)
                 logger.print_line(logger.insert_space(f"Adding Tag: {tag}", 8), self.config.loglevel)
+                if self.config.plan:
+                    self.config.plan.set_reason(reason_msg)
                 if not self.config.dry_run:
                     torrent.add_tags(tag)
                     torrent_tags += f", {tag}"
@@ -737,6 +765,10 @@ class ShareLimits:
                         logger.print_line(logger.insert_space(f"Torrent Name: {torrent.name}", 3), self.config.loglevel)
                         logger.print_line(logger.insert_space(f"Tracker: {tracker}", 8), self.config.loglevel)
                     logger.print_line(logger.insert_space(f"Limit UL Speed: {limit_upload_speed} kB/s", 8), self.config.loglevel)
+                    if self.config.plan:
+                        self.config.plan.set_reason(
+                            f"Limit upload speed to {limit_upload_speed} kB/s while exclusion condition holds"
+                        )
                     if not self.config.dry_run:
                         torrent.set_upload_limit(limit_upload_speed * 1024)
 

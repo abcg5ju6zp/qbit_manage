@@ -7,6 +7,7 @@ import { API } from './api.js';
 import { ConfigForm } from './components/config-form.js';
 import { CommandPanel } from './components/command-panel.js';
 import { LogViewer } from './components/log-viewer.js';
+import { PlansView } from './components/plans-view.js';
 import { SchedulerControl } from './components/SchedulerControl.js';
 import { SecurityComponent } from './components/security.js';
 import { get, query, queryAll, show, hide, showLoading, hideLoading } from './utils/dom.js';
@@ -186,6 +187,12 @@ class QbitManageApp {
         });
         // Initialize the LogViewer component
         this.logViewer.init();
+
+        // Initialize execution plans view
+        const plansContainer = get('plans-section');
+        if (plansContainer) {
+            this.plansView = new PlansView({ container: plansContainer, api: this.api });
+        }
     }
 
     initSchedulerControl() {
@@ -770,16 +777,26 @@ class QbitManageApp {
         const logsSection = get('logs-section');
         const schedulerSection = get('scheduler-section');
         const securitySection = get('security-section');
+        const plansSection = get('plans-section');
 
         if (sectionName === 'logs') {
             if (mainContentSection) hide(mainContentSection);
             if (schedulerSection) hide(schedulerSection);
             if (securitySection) hide(securitySection);
+            if (plansSection) hide(plansSection);
             this.logViewer.show(); // Use the LogViewer's show method
+        } else if (sectionName === 'plans') {
+            if (mainContentSection) hide(mainContentSection);
+            if (schedulerSection) hide(schedulerSection);
+            if (securitySection) hide(securitySection);
+            if (logsSection) hide(logsSection);
+            if (plansSection) show(plansSection);
+            if (this.plansView) this.plansView.showList();
         } else if (sectionName === 'scheduler') {
             if (mainContentSection) hide(mainContentSection);
             if (logsSection) hide(logsSection);
             if (securitySection) hide(securitySection);
+            if (plansSection) hide(plansSection);
             this.logViewer.hide(); // Use the LogViewer's hide method
             if (schedulerSection) show(schedulerSection);
 
@@ -789,6 +806,7 @@ class QbitManageApp {
             if (mainContentSection) hide(mainContentSection);
             if (logsSection) hide(logsSection);
             if (schedulerSection) hide(schedulerSection);
+            if (plansSection) hide(plansSection);
             if (securitySection) show(securitySection);
             this.logViewer.hide(); // Use the LogViewer's hide method
 
@@ -799,6 +817,7 @@ class QbitManageApp {
             if (logsSection) hide(logsSection);
             if (schedulerSection) hide(schedulerSection);
             if (securitySection) hide(securitySection);
+            if (plansSection) hide(plansSection);
             this.logViewer.hide(); // Use the LogViewer's hide method
             // Load current section for config forms
             if (this.configData) {
@@ -1101,6 +1120,9 @@ class QbitManageApp {
 
     async executeCommands(commands, options) {
         try {
+            if (options.mode === 'plan') {
+                return await this.createExecutionPlan(commands, options);
+            }
             this.showSection('logs');
             this.logViewer.clearLogs();
             this.logViewer.log('info', `Executing commands: ${commands.join(', ')} with options: ${JSON.stringify(options)}`);
@@ -1131,6 +1153,33 @@ class QbitManageApp {
             this.logViewer.log('error', `Command execution failed: ${error.message}`);
 
             // Refresh logs even on error to show any server-side logs
+            await this.logViewer.loadRecentLogs();
+        }
+    }
+
+    async createExecutionPlan(commands, options) {
+        try {
+            this.showSection('logs');
+            this.logViewer.clearLogs();
+            this.logViewer.log('info', `Creating execution plan for: ${commands.join(', ')}`);
+            const response = await this.api.createPlan({
+                commands: commands,
+                config_file: this.currentConfig,
+                hashes: options.hashes || [],
+                log_level: options.log_level
+            });
+            const plans = response.plans || [];
+            if (!plans.length) {
+                showToast('No plan was created', 'warning');
+                return;
+            }
+            const plan = plans[0];
+            showToast(`Plan ${plan.plan_id.slice(0, 8)} created with ${plan.action_count} action(s)`, 'success');
+            this.showSection('plans');
+            if (this.plansView) await this.plansView.openPlan(plan.plan_id);
+        } catch (error) {
+            console.error('Failed to create execution plan:', error);
+            showToast(`Failed to create execution plan: ${error.message}`, 'error');
             await this.logViewer.loadRecentLogs();
         }
     }

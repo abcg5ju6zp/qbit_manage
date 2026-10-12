@@ -19,6 +19,8 @@ class Tags:
         self.stalled_tag = qbit_manager.config.stalled_tag
         self.private_tag = qbit_manager.config.private_tag
         self.tag_stalled_torrents = self.config.settings["tag_stalled_torrents"]
+        if self.config.plan:
+            self.config.plan.set_context("tag_update")
 
         self.tags()
         self.config.webhooks_factory.notify(self.torrents_updated, self.notify_attr, group_by="tag")
@@ -44,6 +46,10 @@ class Tags:
                 body += logger.print_line(logger.insert_space(f"Torrent Name: {t_name}", 3), self.config.loglevel)
                 body += logger.print_line(logger.insert_space(f"Removing Tag: {self.stalled_tag}", 3), self.config.loglevel)
                 body += logger.print_line(logger.insert_space(f"Tracker: {tracker['url']}", 8), self.config.loglevel)
+                if self.config.plan:
+                    self.config.plan.set_reason(
+                        f"Torrent no longer stalled (state={torrent.state}); removing tag {self.stalled_tag}"
+                    )
                 if not self.config.dry_run:
                     torrent.remove_tags(self.stalled_tag)
             if (
@@ -75,6 +81,11 @@ class Tags:
                         self.config.loglevel,
                     )
                     body += logger.print_line(logger.insert_space(f"Tracker: {tracker['url']}", 8), self.config.loglevel)
+                    if self.config.plan:
+                        self.config.plan.set_reason(
+                            f"Add tracker tag(s) {', '.join(tags_to_add)} for {tracker['url']} "
+                            f"(missing from torrent tags)"
+                        )
                     if not self.config.dry_run:
                         torrent.add_tags(tags_to_add)
                     category = self.qbt.get_category(torrent.save_path)[0] if torrent.category == "" else torrent.category

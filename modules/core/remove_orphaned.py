@@ -34,6 +34,8 @@ class RemoveOrphaned:
         self.remote_dir = qbit_manager.config.remote_dir
         self.root_dir = qbit_manager.config.root_dir
         self.orphaned_dir = qbit_manager.config.orphaned_dir
+        if qbit_manager.config.plan:
+            qbit_manager.config.plan.set_context("rem_orphaned")
 
         # Try to use ThreadPoolExecutor, but fall back to synchronous if thread creation fails
         try:
@@ -158,7 +160,12 @@ class RemoveOrphaned:
         self.config.send_notifications(attr)
 
         # Batch process orphaned files
-        if not self.config.dry_run:
+        if self.config.plan:
+            # Capture one planned action per file (plus empty-parent cleanups)
+            # without touching the filesystem.
+            self.config.plan.set_context("rem_orphaned")
+            self.config.plan.record_orphan_files(orphaned_files)
+        elif not self.config.dry_run:
             orphaned_parent_paths = set()
 
             # Process files in batches to reduce I/O overhead

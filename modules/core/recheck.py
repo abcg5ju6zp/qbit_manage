@@ -20,6 +20,8 @@ class ReCheck:
         self.notify_attr_recheck = []
         self.torrents_updated_resume = []  # List of torrents updated
         self.notify_attr_resume = []  # List of single torrent attributes to send to notifiarr
+        if self.config.plan:
+            self.config.plan.set_context("recheck")
 
         self.recheck()
         self.config.webhooks_factory.notify(self.torrents_updated_resume, self.notify_attr_resume, group_by="tag")
@@ -60,6 +62,10 @@ class ReCheck:
                             }
                             self.torrents_updated_resume.append(t_name)
                             self.notify_attr_resume.append(attr)
+                            if self.config.plan:
+                                self.config.plan.set_reason(
+                                    "Resume completed paused torrent with no share limits set"
+                                )
                             if not self.config.dry_run:
                                 torrent.resume()
                         else:
@@ -110,9 +116,13 @@ class ReCheck:
                                     "notifiarr_indexer": tracker["notifiarr"],
                                 }
                                 self.torrents_updated_resume.append(t_name)
-                                self.notify_attr_resume.append(attr)
-                                if not self.config.dry_run:
-                                    torrent.resume()
+                            self.notify_attr_resume.append(attr)
+                            if self.config.plan:
+                                self.config.plan.set_reason(
+                                    "Resume completed paused torrent whose ratio/seed time limits are unmet"
+                                )
+                            if not self.config.dry_run:
+                                torrent.resume()
                     # Recheck
                     elif (
                         torrent.progress == 0
@@ -136,6 +146,10 @@ class ReCheck:
                         }
                         self.torrents_updated_recheck.append(t_name)
                         self.notify_attr_recheck.append(attr)
+                        if self.config.plan:
+                            self.config.plan.set_reason(
+                                "Force recheck: torrent reports 0% progress but data is complete"
+                            )
                         if not self.config.dry_run:
                             torrent.recheck()
 

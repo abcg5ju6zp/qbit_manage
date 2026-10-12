@@ -244,6 +244,36 @@ class API {
         return this.get('/commands/history', { limit });
     }
 
+    // Execution Plan Endpoints
+
+    async createPlan(data) {
+        return this.post('/plans', data);
+    }
+
+    async listPlans() {
+        return this.get('/plans');
+    }
+
+    async getPlan(planId, validate = false) {
+        return this.get(`/plans/${encodeURIComponent(planId)}`, validate ? { validate: true } : {});
+    }
+
+    async confirmPlan(planId, skipIds = []) {
+        return this.post(`/plans/${encodeURIComponent(planId)}/confirm`, { skip_ids: skipIds });
+    }
+
+    async resumePlan(planId) {
+        return this.post(`/plans/${encodeURIComponent(planId)}/resume`, {});
+    }
+
+    async skipPlanAction(planId, actionId) {
+        return this.post(`/plans/${encodeURIComponent(planId)}/actions/${encodeURIComponent(actionId)}/skip`, {});
+    }
+
+    async deletePlan(planId) {
+        return this.delete(`/plans/${encodeURIComponent(planId)}`);
+    }
+
 
     // qBittorrent Integration Endpoints
 

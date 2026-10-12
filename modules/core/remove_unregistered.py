@@ -34,6 +34,8 @@ class RemoveUnregistered:
         self.rem_unregistered_max_torrents = self.config.settings["rem_unregistered_max_torrents"]
         self.hashes = hashes
         self.tracker_del_count = {}
+        if self.config.plan:
+            self.config.plan.set_context("rem_unregistered" if self.cfg_rem_unregistered else "tag_tracker_error")
 
         tag_error_msg = "Tagging Torrents with Tracker Errors" if self.cfg_tag_error else ""
         rem_unregistered_msg = "Removing Unregistered Torrents" if self.cfg_rem_unregistered else ""
@@ -72,6 +74,8 @@ class RemoveUnregistered:
                 body += logger.print_line(logger.insert_space(f"Torrent Name: {t_name}", 3), self.config.loglevel)
                 body += logger.print_line(logger.insert_space(f"Removed Tag: {self.tag_error}", 4), self.config.loglevel)
                 body += logger.print_line(logger.insert_space(f"Tracker: {tracker['url']}", 8), self.config.loglevel)
+                if self.config.plan:
+                    self.config.plan.set_reason("Tracker is working again; remove tracker error tag")
                 if not self.config.dry_run:
                     torrent.remove_tags(tags=self.tag_error)
                 attr = {
@@ -316,6 +320,8 @@ class RemoveUnregistered:
         }
         self.torrents_updated_issue.append(self.t_name)
         self.notify_attr_issue.append(attr)
+        if self.config.plan:
+            self.config.plan.set_reason(f"Tracker error status: {msg}")
         if not self.config.dry_run:
             torrent.add_tags(tags=self.tag_error)
 
@@ -335,6 +341,8 @@ class RemoveUnregistered:
             "torrent_tracker": tracker["url"],
             "notifiarr_indexer": tracker["notifiarr"],
         }
+        if self.config.plan:
+            self.config.plan.set_reason(f"Tracker reports torrent as unregistered: {msg}")
         if self.qbt.has_cross_seed(torrent):
             # Checks if any of the original torrents are working
             if "" in self.t_msg or 2 in self.t_status:

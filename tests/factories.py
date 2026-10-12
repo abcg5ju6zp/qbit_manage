@@ -68,6 +68,13 @@ class FakeClient:
 
     def __init__(self, *, tags=None, preferences=None):
         self.torrent_tags = _Tags(tags or [])
+        self.torrent_categories = SimpleNamespace(calls=[], categories={})
+
+        def _create_category(name=None, save_path=None, **kwargs):
+            self.torrent_categories.calls.append((name, save_path))
+            self.torrent_categories.categories[name] = save_path
+
+        self.torrent_categories.create_category = _create_category
         prefs = preferences or {}
         self.app = SimpleNamespace(
             version="v4.6.0",
@@ -285,6 +292,7 @@ class FakeConfig:
             "rem_unregistered_grace_minutes": 0,
             "rem_unregistered_max_torrents": 0,
             "rem_unregistered_ignore_list": [],
+            "tag_stalled_torrents": False,
         }
     )
     root_dir: str = "/data/torrents/"
@@ -301,6 +309,8 @@ class FakeConfig:
         }
     )
     share_limits_custom_tags: list = field(default_factory=list)
+    # Runtime execution-plan capture context (None in ordinary tests)
+    plan: Any = None
     notifications_sent: list = field(default_factory=list)
     notify_calls: list = field(default_factory=list)
     # Category-specific
@@ -416,8 +426,16 @@ class FakeQbtManager:
         self.tor_delete_recycle_calls.append((torrent, copy.deepcopy(attr)))
 
     def get_category(self, path):
-        """Return 'Uncategorized' for all save paths (overridable via subclassing or monkeypatching)."""
+        """Return 'Uncategorized' for all save paths (overridable via subclassing)."""
         return "Uncategorized"
+
+    def get_category_save_paths(self):
+        """Plan orphan-rmdir validation consults category save paths."""
+        return {}
+
+    def get_torrent_info(self):
+        """Present on the real Qbt wrapper; no-op for the fake."""
+        return None
 
     @property
     def torrent_list(self):

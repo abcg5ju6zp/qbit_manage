@@ -310,7 +310,9 @@ class CommandPanel {
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary modal-cancel-btn">Cancel</button>
-                    <button type="button" class="btn btn-primary modal-execute-btn">Execute Commands</button>
+                    <button type="button" class="btn btn-outline modal-mode-btn" data-mode="dry">Dry Run</button>
+                    <button type="button" class="btn btn-secondary modal-mode-btn" data-mode="plan">Create Plan</button>
+                    <button type="button" class="btn btn-primary modal-mode-btn" data-mode="run">Run Now</button>
                 </div>
             </div>
         `;
@@ -351,43 +353,47 @@ class CommandPanel {
             if (e.target === modal) closeModal();
         });
 
-        modal.querySelector('.modal-execute-btn').addEventListener('click', async () => {
-            const selectedCommands = Array.from(modal.querySelectorAll('input[name="commands"]:checked'))
-                .map(input => input.value);
+        modal.querySelectorAll('.modal-mode-btn').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const mode = btn.dataset.mode;
+                const selectedCommands = Array.from(modal.querySelectorAll('input[name="commands"]:checked'))
+                    .map(input => input.value);
 
-            const dryRun = modal.querySelector('#dry-run-option').checked;
-            const skipCleanup = modal.querySelector('#skip-cleanup-option').checked;
-            const skipQbVersionCheck = modal.querySelector('#skip-qb-version-check-option').checked;
-            const hashesText = modal.querySelector('#torrent-hashes').value.trim();
-            const hashes = hashesText ? hashesText.split('\n').map(h => h.trim()).filter(h => h) : [];
-            const logLevel = modal.querySelector('#log-level-select').value;
+                const dryRun = mode === 'dry';
+                const skipCleanup = modal.querySelector('#skip-cleanup-option').checked;
+                const skipQbVersionCheck = modal.querySelector('#skip-qb-version-check-option').checked;
+                const hashesText = modal.querySelector('#torrent-hashes').value.trim();
+                const hashes = hashesText ? hashesText.split('\n').map(h => h.trim()).filter(h => h) : [];
+                const logLevel = modal.querySelector('#log-level-select').value;
 
-            if (selectedCommands.length === 0) {
-                showToast('Please select at least one command', 'warning');
-                return;
-            }
+                if (selectedCommands.length === 0) {
+                    showToast('Please select at least one command', 'warning');
+                    return;
+                }
 
-            // Save current selections to localStorage
-            localStorage.setItem('qbm-selected-commands', JSON.stringify(selectedCommands));
-            localStorage.setItem('qbm-dry-run-option', dryRun);
-            localStorage.setItem('qbm-skip-cleanup-option', skipCleanup);
-            localStorage.setItem('qbm-skip-qb-version-check-option', skipQbVersionCheck);
-            localStorage.setItem('qbm-log-level-option', logLevel);
+                // Save current selections to localStorage
+                localStorage.setItem('qbm-selected-commands', JSON.stringify(selectedCommands));
+                localStorage.setItem('qbm-dry-run-option', dryRun);
+                localStorage.setItem('qbm-skip-cleanup-option', skipCleanup);
+                localStorage.setItem('qbm-skip-qb-version-check-option', skipQbVersionCheck);
+                localStorage.setItem('qbm-log-level-option', logLevel);
 
-            this.hideRunCommandsModal(); // Use the new hide method
+                this.hideRunCommandsModal();
 
-            try {
-                await this.onCommandExecute(selectedCommands, {
-                    dryRun,
-                    hashes,
-                    skip_cleanup: skipCleanup,
-                    skip_qb_version_check: skipQbVersionCheck,
-                    log_level: logLevel
-                });
-            } catch (error) {
-                console.error('Failed to execute commands:', error);
-                showToast('Failed to execute commands', 'error');
-            }
+                try {
+                    await this.onCommandExecute(selectedCommands, {
+                        mode,
+                        dryRun,
+                        hashes,
+                        skip_cleanup: skipCleanup,
+                        skip_qb_version_check: skipQbVersionCheck,
+                        log_level: logLevel
+                    });
+                } catch (error) {
+                    console.error('Failed to execute commands:', error);
+                    showToast('Failed to execute commands', 'error');
+                }
+            });
         });
     }
 

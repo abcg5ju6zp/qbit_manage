@@ -133,6 +133,9 @@ class Config:
 
     def __init__(self, default_dir, args):
         self.args = args
+        # Runtime-only execution-plan capture context (None outside the Web UI
+        # plan flow; not a user-facing configuration key).
+        self.plan = None
         self.config_file = args["config_file"]
         if self.config_file and os.path.exists(self.config_file):
             self.config_path = os.path.abspath(self.config_file)

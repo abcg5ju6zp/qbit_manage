@@ -28,6 +28,8 @@ class TagNoHardLinks:
         self.notify_attr_untagged = []
 
         self.status_filter = "completed" if self.config.settings["tag_nohardlinks_filter_completed"] else "all"
+        if self.config.plan:
+            self.config.plan.set_context("tag_nohardlinks")
 
         self.tag_nohardlinks()
 
@@ -42,6 +44,8 @@ class TagNoHardLinks:
         body.append(logger.insert_space(f"{tag_action}: {self.nohardlinks_tag}", 6))
         title = "Tagging Torrents with No Hardlinks"
         body.append(logger.insert_space(f"Tracker: {tracker['url']}", 8))
+        if self.config.plan:
+            self.config.plan.set_reason(f"No hard links found for torrent content; add tag {self.nohardlinks_tag}")
         if not self.config.dry_run:
             torrent.add_tags(self.nohardlinks_tag)
         self.stats_tagged += 1
@@ -75,6 +79,10 @@ class TagNoHardLinks:
             tag_action = "Not Removing Tag (Dry-Run)" if self.config.dry_run else "Removed Tag"
             body += logger.print_line(logger.insert_space(f"{tag_action}: {self.nohardlinks_tag}", 6), self.config.loglevel)
             body += logger.print_line(logger.insert_space(f"Tracker: {tracker['url']}", 8), self.config.loglevel)
+            if self.config.plan:
+                self.config.plan.set_reason(
+                    f"Hard links now present for previously tagged torrent; remove tag {self.nohardlinks_tag}"
+                )
             if not self.config.dry_run:
                 torrent.remove_tags(tags=self.nohardlinks_tag)
             attr = {

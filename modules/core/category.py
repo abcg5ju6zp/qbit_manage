@@ -20,6 +20,8 @@ class Category:
         self.uncategorized_mapping = "Uncategorized"
         self.status_filter = "completed" if self.config.settings["cat_filter_completed"] else "all"
         self.cat_update_all = self.config.settings["cat_update_all"]
+        if self.config.plan:
+            self.config.plan.set_context("cat_update")
         self.category()
         self.change_categories()
         self.config.webhooks_factory.notify(self.torrents_updated, self.notify_attr, group_by="category")
@@ -114,6 +116,11 @@ class Category:
         tracker = self.qbt.get_tags(self.qbt.get_tracker_urls(torrent.trackers))
         t_name = torrent.name
         old_cat = torrent.category
+        if self.config.plan:
+            change_note = f"category change rule '{cat_change}'" if cat_change else f"tracker/path mapping ({tracker['url']})"
+            self.config.plan.set_reason(
+                f"Move category '{old_cat}' -> '{new_cat}' based on {change_note}"
+            )
         if not self.config.dry_run:
 
             @handle_qbit_api_errors(context="set_category", retry_attempts=2)
