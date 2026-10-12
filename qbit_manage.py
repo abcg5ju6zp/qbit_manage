@@ -8,6 +8,7 @@ import platform
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from datetime import datetime
 from datetime import timedelta
@@ -469,6 +470,7 @@ def start():
         start_time = datetime.now()
         args["time"] = start_time.strftime("%H:%M")
         args["time_obj"] = start_time
+        args["run_id"] = uuid.uuid4().hex
         stats_summary = []
         logger.separator("Starting Run")
         cfg = None
@@ -606,12 +608,19 @@ def start():
             try:
                 next_run = next_scheduled_run_info_shared.get("next_run")
                 cfg.webhooks_factory.end_time_hooks(start_time, end_time, run_time, next_run, stats, body)
+                # Give notifications still unconfirmed (timeouts etc.) one more
+                # delivery pass before the process may exit.
+                cfg.webhooks_factory.flush_pending()
                 # Release flag after all cleanup is complete
                 with is_running_lock:
                     is_running.value = False
             except Failed as err:
                 logger.stacktrace()
                 logger.error(f"Webhooks Error: {err}")
+                try:
+                    cfg.webhooks_factory.flush_pending()
+                except Exception:
+                    pass
                 # Release flag even if webhooks fail
                 with is_running_lock:
                     is_running.value = False

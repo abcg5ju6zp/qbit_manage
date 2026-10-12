@@ -1,21 +1,31 @@
 """Class to handle webhooks."""
 
+import json
+import os
 import time
-from json import JSONDecodeError
-
-from requests.exceptions import JSONDecodeError as requestsJSONDecodeError
+import uuid
 
 from modules import util
+from modules.notification_store import DB_FILENAME
+from modules.notification_store import OUTCOME_CONFIRMED
+from modules.notification_store import OUTCOME_PERMANENT
+from modules.notification_store import RECOVERY_TIMEOUT
+from modules.notification_store import NotificationStore
+from modules.notification_store import classify_response
+from modules.notification_store import deliver_row
+from modules.notification_store import payload_matches
 
 logger = util.logger
 
 GROUP_NOTIFICATION_LIMIT = 10
+REQUEST_ATTEMPTS = 6
+REQUEST_DELAY = 2
 
 
 class Webhooks:
     """Class to handle webhooks."""
 
-    def __init__(self, config, system_webhooks, notifiarr=None, apprise=None, web_api_used=False):
+    def __init__(self, config, system_webhooks, notifiarr=None, apprise=None, web_api_used=False, run_id=None):
         """Initialize the class."""
         self.config = config
         self.error_webhooks = system_webhooks["error"] if "error" in system_webhooks else []
@@ -31,68 +41,164 @@ class Webhooks:
         self.notifiarr = notifiarr
         self.apprise = apprise
         self.web_api_used = web_api_used
+        self.run_id = run_id or (getattr(config, "args", None) or {}).get("run_id") or uuid.uuid4().hex
+        function_hooks = self.function_webhooks
+        self.enabled = bool(
+            self.error_webhooks
+            or self.run_start_webhooks
+            or self.run_end_webhooks
+            or (isinstance(function_hooks, dict) and any(function_hooks.values()))
+        )
+        self._store = None
 
-    def request_and_check(self, webhook, json):
-        """
-        Send a webhook request and check for errors.
-        retry up to 6 times if the response is a 500+ error.
-        """
-        retry_count = 0
-        retry_attempts = 6
-        request_delay = 2
-        for retry_count in range(retry_attempts):
-            if webhook == "notifiarr":
-                response = self.notifiarr.notification(json=json)
-            else:
-                webhook_post = webhook
-                if webhook == "apprise":
-                    json["urls"] = self.apprise.notify_url
-                    webhook_post = f"{self.apprise.api_url}/notify"
-                response = self.config.post(webhook_post, json=json)
-            if response.status_code < 500:
-                return response
-            logger.debug(f"({response.status_code} [{response.reason}]) Retrying in {request_delay} seconds.")
-            time.sleep(request_delay)
-            logger.debug(f"(Retry {retry_count + 1} of {retry_attempts}.")
-            retry_count += 1
-        logger.warning(f"({response.status_code} [{response.reason}]) after {retry_attempts} attempts.")
+    def _get_store(self):
+        """Open the persistent outbox lazily; fall back to an in-memory one."""
+        if self._store is not None:
+            return self._store
+        if not self.enabled:
+            return None
+        try:
+            self._store = NotificationStore(os.path.join(self.config.default_dir, DB_FILENAME))
+        except Exception as err:
+            logger.error(f"Notification state store unavailable, retrying will not survive restarts ({err})")
+            try:
+                self._store = NotificationStore(":memory:")
+            except Exception:
+                self._store = None
+        return self._store
 
-    def _request(self, webhooks, json):
-        """
-        Send a webhook request via request_and_check.
-        Check for errors and log them.
-        """
-        logger.trace("")
-        logger.trace(f"JSON: {json}")
+    def _freeze_target(self, webhook):
+        """Resolve a configured target to its kind and immutable delivery spec."""
+        if webhook == "notifiarr":
+            spec = {
+                "url": self.notifiarr.url,
+                "apikey": self.notifiarr.apikey,
+                "instance": self.notifiarr.instance,
+                "qbt_host": (self.config.data.get("qbt") or {}).get("host"),
+            }
+            return "notifiarr", spec
+        if webhook == "apprise":
+            spec = {"api_url": self.apprise.api_url, "notify_url": self.apprise.notify_url}
+            return "apprise", spec
+        return "webhook", {"url": webhook}
+
+    def _resolve_targets(self, webhooks):
+        """Return frozen ``(kind, spec)`` targets, preserving legacy guards."""
+        targets = []
         for webhook in list(set(webhooks)):
-            response = None
             logger.trace(f"Webhook: {webhook}")
             if webhook is None:
                 break
             elif (webhook == "notifiarr" and self.notifiarr is None) or (webhook == "apprise" and self.apprise is None):
                 logger.warning(f"Webhook attribute set to {webhook} but {webhook} attribute is not configured.")
                 break
-            response = self.request_and_check(webhook, json)
-            if response is not None:
-                skip = False
-                try:
-                    response_json = response.json()
-                    logger.trace(f"Response: {response_json}")
-                    if (
-                        "result" in response_json
-                        and response_json["result"] == "error"
-                        and "details" in response_json
-                        and "response" in response_json["details"]
-                    ):
-                        logger.error(f"Notifiarr Error: Unable to send notification ({response_json['details']['response']})")
-                        skip = True
-                    if (
-                        response.status_code >= 400 or ("result" in response_json and response_json["result"] == "error")
-                    ) and skip is False:
-                        logger.error(f"Notifiarr Error: Unable to send notification ({response.status_code} [{response.reason}])")
-                except (JSONDecodeError, requestsJSONDecodeError):
-                    if response.status_code >= 400:
-                        logger.error(f"Notifiarr Error: Unable to send notification ({response.status_code} [{response.reason}])")
+            targets.append(self._freeze_target(webhook))
+        return targets
+
+    def _transmit_once(self, kind, spec, payload):
+        """One live HTTP attempt through the config's retrying session helpers."""
+        if kind == "webhook":
+            response = self.config.post(spec["url"], json=payload)
+        elif kind == "apprise":
+            # Copy the payload: legacy code injected "urls" into the dict only
+            # for the Apprise target, other targets must keep seeing the original.
+            response = self.config.post(f"{spec['api_url']}/notify", json={**payload, "urls": spec["notify_url"]})
+        else:
+            response = self.config.get(
+                f"{spec['url']}notification/qbitManage/",
+                json=payload,
+                headers={"X-API-Key": spec["apikey"]},
+                params={"qbit_client": spec.get("qbt_host"), "instance": spec.get("instance")},
+            )
+            time.sleep(1)  # Pause for 1 second before sending the next request
+        return response
+
+    def _record_outcome(self, row, outcome, http_status, error):
+        """Persist the per-target confirmation/failure and log it."""
+        if outcome == OUTCOME_CONFIRMED:
+            self._store.mark_confirmed(row["id"], http_status)
+        elif outcome == OUTCOME_PERMANENT:
+            logger.error(error)
+            self._store.mark_permanent(row["id"], error, http_status)
+        else:
+            self._store.mark_temporary(row["id"], error, http_status)
+
+    def _deliver_live(self, row):
+        """Send a freshly recorded event, keeping the legacy 6x/2s retry loop."""
+        if not payload_matches(row["payload_json"], row["payload_digest"]):
+            error = "Notification payload integrity check failed; refusing to send altered content"
+            logger.error(error)
+            self._store.mark_permanent(row["id"], error)
+            return
+        spec = json.loads(row["target_json"])
+        payload = json.loads(row["payload_json"])
+        response = None
+        for attempt in range(REQUEST_ATTEMPTS):
+            try:
+                self._store.renew_lease(row["id"])
+                response = self._transmit_once(row["target_kind"], spec, payload)
+            except Exception as err:
+                # Transport failures (incl. tenacity exhaustion) are uncertain:
+                # leave unconfirmed so only this target is retried later.
+                logger.warning(f"Webhook delivery failed ({type(err).__name__}); it will be retried")
+                self._store.mark_temporary(row["id"], type(err).__name__)
+                return
+            if response.status_code < 500:
+                break
+            logger.debug(f"({response.status_code} [{response.reason}]) Retrying in {REQUEST_DELAY} seconds.")
+            time.sleep(REQUEST_DELAY)
+            logger.debug(f"(Retry {attempt + 1} of {REQUEST_ATTEMPTS}.")
+        else:
+            logger.warning(f"({response.status_code} [{response.reason}]) after {REQUEST_ATTEMPTS} attempts.")
+        self._record_outcome(row, *classify_response(row["target_kind"], response))
+
+    def _request(self, webhooks, json, event_type, event_function=None):
+        """
+        Persist the event per target, then deliver. Each target is confirmed
+        independently: a permanent rejection is recorded and queryable, while a
+        temporary failure stays pending and is retried without resending to the
+        targets that already confirmed.
+        """
+        logger.trace("")
+        logger.trace(f"JSON: {json}")
+        targets = self._resolve_targets(webhooks)
+        if not targets:
+            return
+        store = self._get_store()
+        if store is None:
+            return
+        _, row_ids = store.add_event(self.run_id, event_type, targets, json, event_function=event_function)
+        for row in store.get_rows(row_ids):
+            self._deliver_live(row)
+
+    def recover_pending(self):
+        """Retry events left unconfirmed by a prior run, crash or restart.
+
+        Uses the target settings frozen on each row — current config is never
+        consulted, so removed/changed targets (including rotated keys) do not
+        rewrite an old event. One bounded HTTP attempt per target; the normal
+        backoff schedule decides the next try.
+        """
+        if not self.enabled or self.config.args.get("validation_mode", False):
+            return
+        store = self._get_store()
+        if store is None:
+            return
+        store.prune()
+        for row in store.claim_due():
+            if not payload_matches(row["payload_json"], row["payload_digest"]):
+                error = "Notification payload integrity check failed; refusing to send altered content"
+                logger.error(error)
+                store.mark_permanent(row["id"], error)
+                continue
+            outcome, http_status, error = deliver_row(row, self.config.session, timeout=RECOVERY_TIMEOUT)
+            self._record_outcome(row, outcome, http_status, error)
+            if row["target_kind"] == "notifiarr":
+                time.sleep(1)  # match the Notifiarr API pacing used on the live path
+
+    def flush_pending(self):
+        """Drain due pending events at the end of a run (see recover_pending)."""
+        self.recover_pending()
 
     def start_time_hooks(self, start_time):
         """Send a webhook to notify that the run has started."""
@@ -137,6 +243,7 @@ class Webhooks:
                     "commands": enabled_commands,
                     "execution_options": execution_options,
                 },
+                "run_start",
             )
 
     def end_time_hooks(self, start_time, end_time, run_time, next_run, stats, body):
@@ -170,6 +277,7 @@ class Webhooks:
                     "files_deleted_from_recyclebin": stats["recycle_emptied"],
                     "files_deleted_from_orphaned": stats["orphaned_emptied"],
                 },
+                "run_end",
             )
 
     def error_hooks(self, text, function_error=None, critical=True):
@@ -185,12 +293,12 @@ class Webhooks:
             }
             if function_error:
                 json["function_error"] = function_error
-            self._request(self.error_webhooks, json)
+            self._request(self.error_webhooks, json, "run_error", event_function=function_error)
 
     def function_hooks(self, webhook, json):
         """Send a webhook to notify that a function has completed."""
         if self.function_webhooks:
-            self._request(webhook, json)
+            self._request(webhook, json, "function", event_function=json.get("function"))
 
     def notify(self, torrents_updated=[], payload={}, group_by=""):
         if len(torrents_updated) > GROUP_NOTIFICATION_LIMIT:

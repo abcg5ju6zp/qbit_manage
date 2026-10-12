@@ -42,6 +42,7 @@ from slowapi import Limiter
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
+from modules import notification_store
 from modules import util
 from modules.auth import AuthenticationMiddleware
 from modules.auth import AuthSettings
@@ -323,6 +324,7 @@ class WebAPI:
         api_router.put("/schedule")(self.update_schedule)
         api_router.post("/schedule/persistence/toggle")(self.toggle_schedule_persistence)
 
+        api_router.get("/notification-deliveries")(self.get_notification_deliveries)
         api_router.get("/logs")(self.get_logs)
         api_router.get("/log_files")(self.list_log_files)
         api_router.get("/docs")(self.get_documentation)
@@ -1164,6 +1166,26 @@ class WebAPI:
             logger.error(f"Error reading log file {log_file_path}: {str(e)}")
             logger.stacktrace()
             raise HTTPException(status_code=500, detail=f"Failed to read log file: {str(e)}")
+
+    async def get_notification_deliveries(
+        self,
+        status: Optional[str] = None,
+        run_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        """List notification deliveries (per-target confirmations and failures)."""
+        valid_statuses = ("pending", "confirmed", "failed")
+        if status is not None and status not in valid_statuses:
+            raise HTTPException(status_code=400, detail=f"status must be one of: {', '.join(valid_statuses)}")
+        db_path = Path(self.default_dir) / notification_store.DB_FILENAME
+        store = notification_store.NotificationStore(str(db_path), create=False)
+        try:
+            return {"deliveries": store.list_deliveries(status=status, run_id=run_id, limit=limit)}
+        except Exception as e:
+            logger.error(f"Error reading notification deliveries: {str(e)}")
+            raise HTTPException(status_code=500, detail="Failed to read notification deliveries")
+        finally:
+            store.close()
 
     async def get_documentation(self, file: str):
         """Get documentation content from markdown files."""

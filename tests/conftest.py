@@ -94,10 +94,14 @@ def fake_logger(monkeypatch):
     from modules.core import remove_orphaned as remove_orphaned_mod
     from modules.core import remove_unregistered as remove_unregistered_mod
     from modules.core import share_limits as share_limits_mod
+    from modules import notification_store as notification_store_mod
+    from modules import webhooks as webhooks_mod
 
     monkeypatch.setattr(share_limits_mod, "logger", fake, raising=False)
     monkeypatch.setattr(remove_unregistered_mod, "logger", fake, raising=False)
     monkeypatch.setattr(remove_orphaned_mod, "logger", fake, raising=False)
+    monkeypatch.setattr(notification_store_mod, "logger", fake, raising=False)
+    monkeypatch.setattr(webhooks_mod, "logger", fake, raising=False)
     return fake
 
 

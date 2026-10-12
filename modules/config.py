@@ -564,6 +564,9 @@ class Config:
             web_api_used=self.web_api_enabled,
         )
         try:
+            # Deliver notifications left unconfirmed by a previous run/crash
+            # before announcing this run, so old results precede new ones.
+            self.webhooks_factory.recover_pending()
             self.webhooks_factory.start_time_hooks(self.start_time)
         except Failed as err:
             logger.stacktrace()
