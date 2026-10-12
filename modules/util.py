@@ -12,6 +12,7 @@ import signal
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -1575,6 +1576,54 @@ def path_replace(path, old_path, new_path):
 
     # Convert back to the platform's preferred separator
     return os.path.normpath(result)
+
+
+@contextmanager
+def settings_file_lock(settings_path):
+    """Exclusive cross-process lock guarding read-modify-write of a settings YAML file.
+
+    Serializes writers in different processes/threads (e.g. auth settings vs. scheduler
+    persistence) on a sibling lock file. The lock file is never deleted on purpose:
+    removing it would let a new holder race with an existing lock.
+    """
+    settings_path = Path(settings_path)
+    lock_path = settings_path.with_name(settings_path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = open(lock_path, "a+b")
+    try:
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
+
+        if platform.system() == "Windows":
+            import msvcrt
+
+            lock_file.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        lock_file.close()
 
 
 class YAML:

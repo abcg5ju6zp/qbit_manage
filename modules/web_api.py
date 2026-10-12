@@ -33,6 +33,7 @@ from fastapi import HTTPException
 from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse
 from fastapi.responses import PlainTextResponse
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -51,7 +52,7 @@ from modules.auth import generate_api_key
 from modules.auth import hash_password
 from modules.auth import is_local_ip
 from modules.auth import load_auth_settings
-from modules.auth import save_auth_settings
+from modules.auth import persist_auth_settings_locked
 from modules.auth import verify_api_key
 from modules.config import Config
 from modules.scheduler import Scheduler
@@ -1737,149 +1738,186 @@ class WebAPI:
             return {"has_api_key": False, "method": "none", "enabled": False}
 
     async def update_security_settings(self, request: SecuritySettingsRequest, req: Request) -> dict[str, Any]:
-        """Update security settings."""
+        """Update security settings with generation-pinned compare-and-swap persistence."""
+        settings_path = Path(self.default_dir) / "qbm_settings.yml"
         try:
-            settings_path = Path(self.default_dir) / "qbm_settings.yml"
-            current_settings = load_auth_settings(settings_path)
+            # Serialize read-verify-write against other tabs, processes and scheduler
+            # writes, so credential verification always targets the generation that is
+            # about to be replaced and an older save can never overwrite a newer one.
+            with util.settings_file_lock(settings_path):
+                current_settings = load_auth_settings(settings_path)
 
-            # Capture original values before any modifications for audit logging
-            original_settings = {
-                "enabled": current_settings.enabled,
-                "method": current_settings.method,
-                "bypass_auth_for_local": current_settings.bypass_auth_for_local,
-                "trusted_proxies": current_settings.trusted_proxies,
-                "username": current_settings.username,
-                "api_key": current_settings.api_key,
-            }
+                # Capture original values before any modifications for audit logging
+                original_settings = {
+                    "enabled": current_settings.enabled,
+                    "method": current_settings.method,
+                    "bypass_auth_for_local": current_settings.bypass_auth_for_local,
+                    "trusted_proxies": current_settings.trusted_proxies,
+                    "username": current_settings.username,
+                    "api_key": current_settings.api_key,
+                }
 
-            # DEBUG: Log the request data to understand what's being sent
-            logger.trace(
-                f"Security settings update request: current_api_key={bool(request.current_api_key)}, "
-                f"current_username={bool(request.current_username)}, "
-                f"current_password={bool(request.current_password)}"
-            )
-            logger.trace(
-                f"Current settings: method={current_settings.method}, "
-                f"has_api_key={bool(current_settings.api_key)}, "
-                f"has_username={bool(current_settings.username)}"
-            )
+                logger.trace(
+                    f"Security settings update request: current_api_key={bool(request.current_api_key)}, "
+                    f"current_username={bool(request.current_username)}, "
+                    f"current_password={bool(request.current_password)}"
+                )
+                logger.trace(
+                    f"Current settings: method={current_settings.method}, "
+                    f"has_api_key={bool(current_settings.api_key)}, "
+                    f"has_username={bool(current_settings.username)}"
+                )
 
-            # Check if this is initial setup (no authentication currently configured)
-            is_initial_setup = not current_settings.enabled or (
-                current_settings.method == "none" and not current_settings.username and not current_settings.api_key
-            )
+                # Check if this is initial setup (no authentication currently configured)
+                is_initial_setup = not current_settings.enabled or (
+                    current_settings.method == "none" and not current_settings.username and not current_settings.api_key
+                )
 
-            # Check if client is local and bypass_auth_for_local is enabled
-            if current_settings.bypass_auth_for_local and is_local_ip(req, current_settings.trusted_proxies):
-                logger.trace("Local client with bypass_auth_for_local enabled, skipping credential verification")
-                auth_verified = True
-            elif is_initial_setup:
-                # Allow initial setup without credentials when no authentication is configured
-                logger.trace("Initial authentication setup detected, skipping credential verification")
-                auth_verified = True
-            else:
-                # Verify current credentials for reauthentication
-                auth_verified = False
-
-            # First, try credentials provided in the request body
-            # Try API key verification first
-            if not auth_verified and request.current_api_key and current_settings.api_key:
-                logger.trace("Attempting API key verification from request body")
-                if verify_api_key(request.current_api_key, current_settings.api_key):
+                # Check if client is local and bypass_auth_for_local is enabled
+                if current_settings.bypass_auth_for_local and is_local_ip(req, current_settings.trusted_proxies):
+                    logger.trace("Local client with bypass_auth_for_local enabled, skipping credential verification")
                     auth_verified = True
-                    logger.trace("API key verification successful")
-                else:
-                    logger.trace("API key verification failed")
-                    return {"success": False, "message": "Invalid current API key"}
-
-            # If API key not provided or invalid, try username/password
-            if not auth_verified and request.current_username and request.current_password:
-                logger.trace("Attempting username/password verification from request body")
-                if authenticate_user(request.current_username, request.current_password, current_settings):
+                elif is_initial_setup:
+                    # Allow initial setup without credentials when no authentication is configured
+                    logger.trace("Initial authentication setup detected, skipping credential verification")
                     auth_verified = True
-                    logger.trace("Username/password verification successful")
                 else:
-                    logger.trace("Username/password verification failed")
-                    return {"success": False, "message": "Invalid current username or password"}
+                    # Verify current credentials for reauthentication
+                    auth_verified = False
 
-            # If no credentials in request body, try to extract from request headers
-            if not auth_verified:
-                logger.trace("No credentials in request body, attempting to extract from headers")
-
-                # Try API key from header
-                api_key_header = req.headers.get("X-API-Key")
-                if api_key_header and current_settings.api_key:
-                    logger.trace("Attempting API key verification from X-API-Key header")
-                    if verify_api_key(api_key_header, current_settings.api_key):
+                # First, try credentials provided in the request body
+                # Try API key verification first
+                if not auth_verified and request.current_api_key and current_settings.api_key:
+                    logger.trace("Attempting API key verification from request body")
+                    if verify_api_key(request.current_api_key, current_settings.api_key):
                         auth_verified = True
-                        logger.trace("API key verification from header successful")
+                        logger.trace("API key verification successful")
+                    else:
+                        logger.trace("API key verification failed")
+                        return {"success": False, "message": "Invalid current API key"}
 
-                # If API key header didn't work, try Basic auth from Authorization header
+                # If API key not provided or invalid, try username/password
+                if not auth_verified and request.current_username and request.current_password:
+                    logger.trace("Attempting username/password verification from request body")
+                    if authenticate_user(request.current_username, request.current_password, current_settings):
+                        auth_verified = True
+                        logger.trace("Username/password verification successful")
+                    else:
+                        logger.trace("Username/password verification failed")
+                        return {"success": False, "message": "Invalid current username or password"}
+
+                # If no credentials in request body, try to extract from request headers
                 if not auth_verified:
-                    auth_header = req.headers.get("Authorization")
-                    if auth_header and auth_header.startswith("Basic "):
-                        logger.trace("Attempting Basic auth verification from Authorization header")
-                        try:
-                            import base64
+                    logger.trace("No credentials in request body, attempting to extract from headers")
 
-                            encoded_credentials = auth_header.split(" ")[1]
-                            decoded_credentials = base64.b64decode(encoded_credentials).decode("utf-8")
-                            username, password = decoded_credentials.split(":", 1)
+                    # Try API key from header
+                    api_key_header = req.headers.get("X-API-Key")
+                    if api_key_header and current_settings.api_key:
+                        logger.trace("Attempting API key verification from X-API-Key header")
+                        if verify_api_key(api_key_header, current_settings.api_key):
+                            auth_verified = True
+                            logger.trace("API key verification from header successful")
 
-                            if authenticate_user(username, password, current_settings):
-                                auth_verified = True
-                                logger.trace("Basic auth verification from header successful")
-                            else:
-                                logger.trace("Basic auth verification from header failed")
-                        except Exception as e:
-                            logger.warning(f"Error parsing Basic auth header: {e}")
+                    # If API key header didn't work, try Basic auth from Authorization header
+                    if not auth_verified:
+                        auth_header = req.headers.get("Authorization")
+                        if auth_header and auth_header.startswith("Basic "):
+                            logger.trace("Attempting Basic auth verification from Authorization header")
+                            try:
+                                import base64
 
-            # If neither method worked and it's not initial setup, require authentication
-            if not auth_verified and not is_initial_setup:
-                logger.warning("No valid current credentials provided for security settings update")
-                return {"success": False, "message": "Current credentials required to update security settings"}
+                                encoded_credentials = auth_header.split(" ")[1]
+                                decoded_credentials = base64.b64decode(encoded_credentials).decode("utf-8")
+                                username, password = decoded_credentials.split(":", 1)
 
-            # Update settings
-            current_settings.enabled = request.enabled
-            current_settings.method = request.method
-            current_settings.bypass_auth_for_local = request.bypass_auth_for_local
-            current_settings.trusted_proxies = request.trusted_proxies
-            current_settings.username = request.username
+                                if authenticate_user(username, password, current_settings):
+                                    auth_verified = True
+                                    logger.trace("Basic auth verification from header successful")
+                                else:
+                                    logger.trace("Basic auth verification from header failed")
+                            except Exception as e:
+                                logger.warning(f"Error parsing Basic auth header: {e}")
 
-            # Handle password
-            if request.password:
-                current_settings.password_hash = hash_password(request.password)
+                # If neither method worked and it's not initial setup, require authentication
+                if not auth_verified and not is_initial_setup:
+                    logger.warning("No valid current credentials provided for security settings update")
+                    return {"success": False, "message": "Current credentials required to update security settings"}
 
-            # Handle API key generation
-            if request.generate_api_key:
-                current_settings.api_key = generate_api_key()
+                # Optimistic concurrency: the generation pinned when the form loaded
+                # must still be the persistent file's generation at commit time.
+                expected_version = request.settings_version or ""
+                current_version = current_settings.settings_version or ""
+                if expected_version and expected_version != current_version:
+                    logger.warning("Security settings update rejected: settings generation mismatch")
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "success": False,
+                            "conflict": True,
+                            "message": "Security settings were changed in another tab or session. Reload the page and try again.",
+                        },
+                    )
 
-            # Handle API key clearing
-            if hasattr(request, "clear_api_key") and request.clear_api_key:
-                current_settings.api_key = ""
+                # Build the complete new settings document from the pinned generation
+                new_settings = current_settings.model_copy(deep=True)
+                new_settings.enabled = request.enabled
+                new_settings.method = request.method
+                new_settings.bypass_auth_for_local = request.bypass_auth_for_local
+                new_settings.trusted_proxies = list(request.trusted_proxies)
+                new_settings.username = request.username
+                if request.password:
+                    new_settings.password_hash = hash_password(request.password)
+                if request.clear_api_key:
+                    new_settings.api_key = ""
 
-            # Save settings
-            if save_auth_settings(settings_path, current_settings):
-                # Force reload authentication settings to ensure immediate effect
-                AuthenticationMiddleware.force_reload_all_settings()
+                # Short-circuit requests that change nothing; the file and its
+                # generation stay untouched.
+                changed = (
+                    bool(request.password)
+                    or bool(request.generate_api_key)
+                    or new_settings.enabled != current_settings.enabled
+                    or new_settings.method != current_settings.method
+                    or new_settings.bypass_auth_for_local != current_settings.bypass_auth_for_local
+                    or list(new_settings.trusted_proxies) != list(current_settings.trusted_proxies)
+                    or new_settings.username != current_settings.username
+                    or new_settings.api_key != current_settings.api_key
+                )
+                if not changed:
+                    return {
+                        "success": True,
+                        "message": "No changes to save",
+                        "api_key": None,
+                        "settings_version": current_version,
+                    }
+
+                # Mint the new key only now, so it belongs solely to the commit that
+                # is about to persist; a failed write discards it and returns nothing.
+                if request.generate_api_key:
+                    new_settings.api_key = generate_api_key()
+
+                try:
+                    saved_settings = persist_auth_settings_locked(settings_path, new_settings)
+                except OSError as e:
+                    logger.error(f"Error saving authentication settings: {e}")
+                    return {"success": False, "message": "Failed to save security settings"}
 
                 # Audit log the security changes by comparing original with updated values
                 changes = []
-                if original_settings["enabled"] != current_settings.enabled:
-                    changes.append(f"enabled: {original_settings['enabled']} -> {current_settings.enabled}")
-                if original_settings["method"] != current_settings.method:
-                    changes.append(f"method: {original_settings['method']} -> {current_settings.method}")
-                if original_settings["bypass_auth_for_local"] != current_settings.bypass_auth_for_local:
+                if original_settings["enabled"] != saved_settings.enabled:
+                    changes.append(f"enabled: {original_settings['enabled']} -> {saved_settings.enabled}")
+                if original_settings["method"] != saved_settings.method:
+                    changes.append(f"method: {original_settings['method']} -> {saved_settings.method}")
+                if original_settings["bypass_auth_for_local"] != saved_settings.bypass_auth_for_local:
                     changes.append(
                         f"bypass_auth_for_local: {original_settings['bypass_auth_for_local']} -> "
-                        f"{current_settings.bypass_auth_for_local}"
+                        f"{saved_settings.bypass_auth_for_local}"
                     )
-                if original_settings["trusted_proxies"] != current_settings.trusted_proxies:
+                if original_settings["trusted_proxies"] != saved_settings.trusted_proxies:
                     changes.append(
-                        f"trusted_proxies: {original_settings['trusted_proxies']} -> {current_settings.trusted_proxies}"
+                        f"trusted_proxies: {original_settings['trusted_proxies']} -> {saved_settings.trusted_proxies}"
                     )
-                if original_settings["username"] != current_settings.username:
-                    changes.append(f"username: {original_settings['username']} -> {current_settings.username}")
+                if original_settings["username"] != saved_settings.username:
+                    changes.append(f"username: {original_settings['username']} -> {saved_settings.username}")
                 if request.password:
                     changes.append("password: [CHANGED]")
                 if request.generate_api_key:
@@ -1890,14 +1928,13 @@ class WebAPI:
                 if changes:
                     logger.info(f"Security settings updated: {', '.join(changes)}")
 
-                logger.info("Authentication settings reloaded after update")
+                logger.info("Authentication settings switched to new generation after update")
                 return {
                     "success": True,
                     "message": "Security settings updated successfully",
-                    "api_key": current_settings.api_key if request.generate_api_key else None,
+                    "api_key": saved_settings.api_key if request.generate_api_key else None,
+                    "settings_version": saved_settings.settings_version,
                 }
-            else:
-                return {"success": False, "message": "Failed to save security settings"}
 
         except Exception as e:
             logger.error(f"Error updating security settings: {str(e)}")

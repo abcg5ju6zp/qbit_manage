@@ -1,5 +1,4 @@
 """Authentication module for qBittorrent-Manage web UI"""
-
 import base64
 import hashlib
 import ipaddress
@@ -7,7 +6,12 @@ import os
 import platform
 import re
 import secrets
+import tempfile
+import threading
 from collections import defaultdict
+from contextlib import suppress
+from dataclasses import dataclass
+from dataclasses import replace as replace_dataclass
 from datetime import datetime
 from datetime import timedelta
 from pathlib import Path
@@ -58,6 +62,9 @@ class AuthSettings(BaseModel):
     username: str = ""
     password_hash: str = ""
     api_key: str = ""
+    # Opaque generation token of the on-disk settings. Every successful change mints a
+    # new token; saves pin the token they read and may only commit against the same one.
+    settings_version: str = ""
 
 
 class AuthResponse(BaseModel):
@@ -79,6 +86,9 @@ class SecuritySettingsRequest(BaseModel):
     password: str = ""
     generate_api_key: bool = False
     clear_api_key: bool = False
+
+    # Generation token pinned from GET /security; a non-empty stale token rejects the save
+    settings_version: str = ""
 
     # Current credentials for reauthentication
     current_username: str = ""
@@ -276,134 +286,288 @@ def is_local_ip(request: Request, trusted_proxies: list[str] = None) -> bool:
         return False
 
 
-class AuthenticationMiddleware(BaseHTTPMiddleware):
-    """Authentication middleware for qBit Manage web UI."""
+@dataclass(frozen=True)
+class _AuthSnapshot:
+    """Immutable generation of authentication settings shared by all middleware instances."""
 
-    # Class variable to store all instances for cache clearing
-    _instances = []
+    settings: AuthSettings
+    file_hash: str | None
+    loaded_at: datetime
 
-    def __init__(self, app, settings_path: Path, base_url: str = ""):
-        super().__init__(app)
-        self.settings_path = settings_path
-        self.base_url = base_url
-        self._settings_cache = None
-        self._last_settings_check = None
-        self._settings_cache_duration = timedelta(seconds=1)  # Cache settings for 1 second
-        self._last_modified_time = None
-        self._file_hash = None  # Store file hash for more reliable change detection
-        # Add this instance to the class list
-        AuthenticationMiddleware._instances.append(self)
+    @property
+    def version(self) -> str:
+        return self.settings.settings_version
 
-    def _calculate_file_hash(self) -> str:
-        """Calculate SHA256 hash of the settings file."""
+
+class AuthSettingsConflict(Exception):
+    """Raised when a save pins a settings generation that no longer matches the file."""
+
+
+class _AuthSettingsStore:
+    """Process-wide holder for one settings file's current immutable snapshot.
+
+    All middleware instances reading the same path share one store, so a generation
+    switch is a single reference assignment: Basic, API-only, local-bypass and trusted
+    proxy decisions can never observe a mix of two generations. Failed reloads keep
+    the last known-good snapshot; the file watcher retries until instances converge
+    to whatever generation the persistent file contains.
+    """
+
+    cache_duration = timedelta(seconds=1)
+
+    def __init__(self, settings_path: Path):
+        self.settings_path = Path(settings_path)
+        self._lock = threading.Lock()
+        self._snapshot: _AuthSnapshot | None = None
+
+    def current(self) -> AuthSettings:
+        """Return the settings of the current generation, reloading if the file changed."""
+        now = datetime.now()
+        snapshot = self._snapshot
+        if snapshot is not None and now - snapshot.loaded_at < self.cache_duration:
+            return snapshot.settings
+
+        with self._lock:
+            snapshot = self._snapshot
+            now = datetime.now()
+            if snapshot is not None and now - snapshot.loaded_at < self.cache_duration:
+                return snapshot.settings
+
+            file_hash = self._hash_file()
+            if snapshot is not None and file_hash is not None and file_hash == snapshot.file_hash:
+                self._snapshot = replace_dataclass(snapshot, loaded_at=now)
+                return snapshot.settings
+
+            return self._reload_locked(file_hash).settings
+
+    def force_reload(self) -> AuthSettings:
+        """Reload from the persistent file and publish its generation."""
+        with self._lock:
+            return self._reload_locked(self._hash_file()).settings
+
+    def publish(self, settings: AuthSettings, file_hash: str | None = None) -> None:
+        """Atomically switch every consumer of this store to the given generation."""
+        if file_hash is None:
+            file_hash = self._hash_file()
+        with self._lock:
+            self._snapshot = _AuthSnapshot(settings=settings, file_hash=file_hash, loaded_at=datetime.now())
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._snapshot = None
+
+    def snapshot(self) -> _AuthSnapshot | None:
+        return self._snapshot
+
+    def _reload_locked(self, file_hash: str | None) -> _AuthSnapshot:
+        settings = self._read_settings_file()
+        if settings is None:
+            # Preserve the old generation and its validation state on read/parse failure.
+            if self._snapshot is not None:
+                self._snapshot = replace_dataclass(self._snapshot, loaded_at=datetime.now())
+                return self._snapshot
+            settings = AuthSettings()
+
+        self._snapshot = _AuthSnapshot(settings=settings, file_hash=file_hash, loaded_at=datetime.now())
+        return self._snapshot
+
+    def _hash_file(self) -> str | None:
         try:
             if self.settings_path.exists():
                 with open(self.settings_path, "rb") as f:
                     return hashlib.sha256(f.read()).hexdigest()
-        except Exception:
+        except OSError:
             pass
         return None
 
-    def _load_auth_settings(self) -> AuthSettings:
-        """Load authentication settings from qbm_settings.yml."""
-        current_time = datetime.now()
-
-        # Check if file has been modified using both mtime and hash
+    def _read_settings_file(self) -> AuthSettings | None:
+        """Read and validate the file, repairing overly permissive modes. None on failure."""
         try:
-            current_modified_time = self.settings_path.stat().st_mtime
-            current_file_hash = self._calculate_file_hash()
+            if not self.settings_path.exists():
+                return AuthSettings()
 
-            # File has been modified if either mtime changed or hash changed
-            file_modified = (self._last_modified_time is not None and current_modified_time > self._last_modified_time) or (
-                self._file_hash is not None and current_file_hash != self._file_hash
-            )
+            if platform.system() != "Windows":
+                try:
+                    stat_info = self.settings_path.stat()
+                    if stat_info.st_mode & 0o077:
+                        logger.warning(
+                            f"Settings file {self.settings_path} has overly permissive permissions. "
+                            f"Fixing to 600 (owner read/write only)."
+                        )
+                        try:
+                            os.chmod(str(self.settings_path), 0o600)
+                            logger.info(f"Fixed permissions for settings file {self.settings_path} to 600.")
+                        except OSError as e:
+                            logger.error(f"Could not fix permissions for settings file: {e}")
+                except (OSError, AttributeError) as e:
+                    logger.warning(f"Could not check permissions for settings file: {e}")
+            else:
+                logger.debug("Skipping file permission check on Windows (uses different permission model)")
 
-            if file_modified:
-                # File has been modified, clear cache
-                self._settings_cache = None
-                self._last_settings_check = None
-                logger.debug("Settings file modified, clearing cache")
-        except (OSError, AttributeError):
-            # If we can't check file status, continue with cache logic
-            current_modified_time = None
-            current_file_hash = None
+            with open(self.settings_path, encoding="utf-8") as f:
+                yaml_loader = ruamel.yaml.YAML(typ="safe")
+                data = yaml_loader.load(f) or {}
 
-        # Use cached settings if they're still fresh and file hasn't been modified
-        if (
-            self._settings_cache is not None
-            and self._last_settings_check is not None
-            and (current_time - self._last_settings_check) < self._settings_cache_duration
-            and not file_modified
-        ):
-            return self._settings_cache
-
-        try:
-            if self.settings_path.exists():
-                # Check file permissions for security (skip on Windows as it uses different permission model)
-                if platform.system() != "Windows":
-                    try:
-                        stat_info = self.settings_path.stat()
-                        # Check if file is readable/writable by group or others (should be 600 or similar)
-                        if stat_info.st_mode & 0o077:  # Check if group/other has any permissions
-                            logger.warning(
-                                f"Settings file {self.settings_path} has overly permissive permissions. "
-                                f"Fixing to 600 (owner read/write only)."
-                            )
-                            try:
-                                os.chmod(str(self.settings_path), 0o600)
-                                logger.info(f"Fixed permissions for settings file {self.settings_path} to 600.")
-                            except OSError as e:
-                                logger.error(f"Could not fix permissions for settings file: {e}")
-                    except (OSError, AttributeError) as e:
-                        logger.warning(f"Could not check permissions for settings file: {e}")
-                else:
-                    logger.debug("Skipping file permission check on Windows (uses different permission model)")
-
-                with open(self.settings_path, encoding="utf-8") as f:
-                    yaml_loader = ruamel.yaml.YAML(typ="safe")
-                    data = yaml_loader.load(f) or {}
-
-                auth_data = data.get("authentication", {})
-                settings = AuthSettings(**auth_data)
-
-                # Cache the settings
-                self._settings_cache = settings
-                self._last_settings_check = current_time
-                self._last_modified_time = current_modified_time
-                self._file_hash = current_file_hash
-                return settings
+            return AuthSettings(**(data.get("authentication") or {}))
         except Exception as e:
             logger.error(f"Error loading authentication settings: {e}")
+            return None
 
-        # Return default settings if loading fails
-        return AuthSettings()
+
+_settings_stores: dict[str, _AuthSettingsStore] = {}
+_settings_stores_lock = threading.Lock()
+
+
+def get_auth_store(settings_path: Path) -> _AuthSettingsStore:
+    """Return the shared store for a settings path, one store per resolved file."""
+    key = str(Path(settings_path).resolve())
+    store = _settings_stores.get(key)
+    if store is None:
+        with _settings_stores_lock:
+            store = _settings_stores.get(key)
+            if store is None:
+                store = _AuthSettingsStore(Path(settings_path))
+                _settings_stores[key] = store
+    return store
+
+
+def force_reload_all_stores() -> list[AuthSettings]:
+    """Reload every known store from disk and return one settings object per store."""
+    with _settings_stores_lock:
+        stores = list(_settings_stores.values())
+    return [store.force_reload() for store in stores]
+
+
+def invalidate_all_stores() -> None:
+    with _settings_stores_lock:
+        stores = list(_settings_stores.values())
+    for store in stores:
+        store.invalidate()
+
+
+def new_settings_version() -> str:
+    """Mint an opaque generation token for a successful settings commit."""
+    return secrets.token_hex(16)
+
+
+def _read_raw_settings(settings_path: Path) -> dict:
+    if not settings_path.exists():
+        return {}
+    with open(settings_path, encoding="utf-8") as f:
+        yaml_loader = ruamel.yaml.YAML(typ="safe")
+        return yaml_loader.load(f) or {}
+
+
+def _fsync_directory(directory: Path) -> None:
+    if platform.system() == "Windows":
+        return
+    try:
+        dir_fd = os.open(str(directory), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
+
+
+def _atomic_write_settings(settings_path: Path, data: dict) -> None:
+    """Write the full YAML document via a durable temp file and atomic replace.
+
+    The target file is never observed half-written and a failed write leaves the
+    previous file (and thus the previous generation) in place.
+    """
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{settings_path.name}.", suffix=".tmp", dir=str(settings_path.parent)
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            yaml = ruamel.yaml.YAML()
+            yaml.indent(mapping=2, sequence=4, offset=2)
+            yaml.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+
+        # Restrict the temp file before it becomes the target, so the replacement
+        # is never readable by group/other, not even for an instant.
+        if platform.system() != "Windows":
+            os.chmod(tmp_path, 0o600)
+
+        os.replace(tmp_path, settings_path)
+        tmp_path = None
+        _fsync_directory(settings_path.parent)
+    finally:
+        if tmp_path is not None:
+            with suppress(OSError):
+                tmp_path.unlink()
+
+
+def persist_auth_settings_locked(settings_path: Path, settings: AuthSettings) -> AuthSettings:
+    """Persist a complete authentication section while the caller holds the file lock.
+
+    Re-reads the full document inside the lock so unrelated sections (e.g. schedule)
+    survive, mints a generation token, writes atomically and publishes the new
+    generation to every middleware consumer.
+    """
+    data = _read_raw_settings(settings_path)
+    # Every changed document defines a new generation; never carry the pinned token.
+    settings.settings_version = new_settings_version()
+    data["authentication"] = settings.model_dump()
+    _atomic_write_settings(settings_path, data)
+    get_auth_store(settings_path).publish(settings)
+    return settings
+
+
+def commit_auth_settings(
+    settings_path: Path, expected_version: str, settings: AuthSettings
+) -> AuthSettings:
+    """Compare-and-swap a full settings document against its pinned generation.
+
+    Raises AuthSettingsConflict when the file has advanced to another generation.
+    """
+    with util.settings_file_lock(settings_path):
+        current = load_auth_settings(settings_path)
+        if expected_version and expected_version != (current.settings_version or ""):
+            raise AuthSettingsConflict(
+                "Security settings were changed in another session; reload and try again."
+            )
+        return persist_auth_settings_locked(Path(settings_path), settings)
+
+
+class AuthenticationMiddleware(BaseHTTPMiddleware):
+    """Authentication middleware for qBit Manage web UI."""
+
+    def __init__(self, app, settings_path: Path, base_url: str = ""):
+        super().__init__(app)
+        self.settings_path = Path(settings_path)
+        self.base_url = base_url
+        # Touch the shared store so all instances of this path serve one generation.
+        get_auth_store(self.settings_path)
+
+    def _load_auth_settings(self) -> AuthSettings:
+        """Return the current shared generation for this settings file."""
+        return get_auth_store(self.settings_path).current()
 
     def clear_cache(self):
-        """Clear the settings cache to force reload on next request."""
-        self._settings_cache = None
-        self._last_settings_check = None
-        self._last_modified_time = None
-        self._file_hash = None
+        """Force the shared snapshot to be considered stale."""
+        get_auth_store(self.settings_path).invalidate()
         logger.trace("Authentication cache cleared")
 
     def force_reload_settings(self) -> AuthSettings:
-        """Force reload settings from file, bypassing cache."""
-        self.clear_cache()
-        return self._load_auth_settings()
+        """Force the shared store to reload the file generation."""
+        return get_auth_store(self.settings_path).force_reload()
 
     @classmethod
     def clear_all_caches(cls):
-        """Clear cache for all middleware instances."""
-        for instance in cls._instances:
-            instance.clear_cache()
+        """Invalidate the shared snapshot of every settings file."""
+        invalidate_all_stores()
 
     @classmethod
     def force_reload_all_settings(cls) -> list[AuthSettings]:
-        """Force reload settings for all middleware instances."""
-        results = []
-        for instance in cls._instances:
-            results.append(instance.force_reload_settings())
-        return results
+        """Reload the persistent generation of every settings file."""
+        return force_reload_all_stores()
 
     async def dispatch(self, request: Request, call_next):
         """Process authentication for each request."""
@@ -557,37 +721,3 @@ def load_auth_settings(settings_path: Path) -> AuthSettings:
 
     # Return default settings if loading fails
     return AuthSettings()
-
-
-def save_auth_settings(settings_path: Path, settings: AuthSettings) -> bool:
-    """Save authentication settings to qbm_settings.yml."""
-    try:
-        # Load existing data
-        data = {}
-        if settings_path.exists():
-            with open(settings_path, encoding="utf-8") as f:
-                yaml_loader = ruamel.yaml.YAML(typ="safe")
-                data = yaml_loader.load(f) or {}
-
-        # Update authentication section
-        data["authentication"] = settings.model_dump()
-
-        # Save back to file
-        yaml = ruamel.yaml.YAML()
-        yaml.indent(mapping=2, sequence=4, offset=2)
-        with open(settings_path, "w", encoding="utf-8") as f:
-            yaml.dump(data, f)
-
-        # Set restrictive permissions (600 - owner read/write only) - skip on Windows
-        if platform.system() != "Windows":
-            try:
-                os.chmod(str(settings_path), 0o600)
-            except OSError as e:
-                logger.error(f"Could not set permissions for settings file: {e}")
-        else:
-            logger.debug("Skipping file permission setting on Windows (uses different permission model)")
-
-        return True
-    except Exception as e:
-        logger.error(f"Error saving authentication settings: {e}")
-        return False

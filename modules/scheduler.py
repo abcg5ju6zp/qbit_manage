@@ -573,33 +573,36 @@ class Scheduler:
         Uses new structure with 'schedule' root key. Preserves other settings in the file.
         If schedule_type/value are None (e.g., user disabled before ever saving), we still write disabled state.
         """
-        # Load existing settings file to preserve other settings
-        existing_data = {}
-        if self.settings_file.exists():
-            try:
-                yaml_loader = YAML(str(self.settings_file))
-                existing_data = yaml_loader.data or {}
-            except Exception:
-                # If we can't read existing file, start fresh
-                existing_data = {}
+        # Hold the same cross-process lock as auth-settings saves: the full
+        # read-modify-write below must not interleave and drop another section.
+        with util.settings_file_lock(self.settings_file):
+            # Load existing settings file to preserve other settings
+            existing_data = {}
+            if self.settings_file.exists():
+                try:
+                    yaml_loader = YAML(str(self.settings_file))
+                    existing_data = yaml_loader.data or {}
+                except Exception:
+                    # If we can't read existing file, start fresh
+                    existing_data = {}
 
-        # Update schedule section
-        schedule_data = {
-            "type": schedule_type,
-            "value": schedule_value,
-            "disabled": self._persistence_disabled,
-            "updated_at": datetime.now().isoformat(),
-        }
+            # Update schedule section
+            schedule_data = {
+                "type": schedule_type,
+                "value": schedule_value,
+                "disabled": self._persistence_disabled,
+                "updated_at": datetime.now().isoformat(),
+            }
 
-        # Merge with existing data
-        existing_data["schedule"] = schedule_data
+            # Merge with existing data
+            existing_data["schedule"] = schedule_data
 
-        tmp_path = self.settings_file.with_suffix(".yml.tmp")
-        yaml_writer = YAML(input_data="")
-        yaml_writer.data = existing_data
-        yaml_writer.path = str(tmp_path)
-        yaml_writer.save()
-        os.replace(tmp_path, self.settings_file)
+            tmp_path = self.settings_file.with_suffix(".yml.tmp")
+            yaml_writer = YAML(input_data="")
+            yaml_writer.data = existing_data
+            yaml_writer.path = str(tmp_path)
+            yaml_writer.save()
+            os.replace(tmp_path, self.settings_file)
 
     def _scheduler_loop(self):
         """Main scheduler loop running in background thread."""

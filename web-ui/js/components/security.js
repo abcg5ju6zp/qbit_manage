@@ -46,11 +46,43 @@ export class SecurityComponent {
                 trusted_proxies: [],
                 username: '',
                 password_hash: '',
-                api_key: ''
+                api_key: '',
+                settings_version: ''
             };
             this.hasApiKey = false;
             this.actualApiKey = '';
         }
+    }
+
+    // Build the common security payload, pinning the generation loaded from the server
+    buildSettingsPayload(extra = {}) {
+        const method = document.getElementById('auth-method')?.value || this.currentSettings?.method || 'none';
+        const allowLocalCheckbox = document.getElementById('allow-local');
+        const trustedProxiesTextarea = document.getElementById('trusted-proxies');
+        return {
+            enabled: method !== 'none',
+            method: method,
+            bypass_auth_for_local: !!(allowLocalCheckbox && allowLocalCheckbox.checked),
+            trusted_proxies: trustedProxiesTextarea
+                ? trustedProxiesTextarea.value.split('\n').map(line => line.trim()).filter(line => line)
+                : (this.currentSettings?.trusted_proxies || []),
+            username: document.getElementById('username')?.value.trim() || '',
+            password: document.getElementById('password')?.value || '',
+            settings_version: this.currentSettings?.settings_version || '',
+            ...extra
+        };
+    }
+
+    // A 409 means another tab/session committed first; surface it and reload the form
+    async handleConflict(error) {
+        if (error?.status !== 409 || !error.data?.conflict) {
+            return false;
+        }
+        showToast(error.data.message || 'Settings changed in another session. Reloading…', 'error');
+        await this.loadSecuritySettings();
+        this.render();
+        this.bindEvents();
+        return true;
     }
 
     maskApiKey(apiKey) {
@@ -265,28 +297,16 @@ export class SecurityComponent {
         }
 
         try {
-            // Get current form values to send complete request
-            const method = document.getElementById('auth-method').value;
-            const allowLocalCheckbox = document.getElementById('allow-local');
-            const allowLocalIps = allowLocalCheckbox && allowLocalCheckbox.checked;
-            const trustedProxiesTextarea = document.getElementById('trusted-proxies');
-            const trustedProxies = trustedProxiesTextarea ? trustedProxiesTextarea.value.split('\n').map(line => line.trim()).filter(line => line) : [];
-            const username = document.getElementById('username')?.value.trim() || '';
-            const password = document.getElementById('password')?.value || '';
-
-            const requestData = {
-                enabled: method !== 'none',
-                method: method,
-                bypass_auth_for_local: allowLocalIps,
-                trusted_proxies: trustedProxies,
-                username: username,
-                password: password,
-                generate_api_key: true
-            };
+            const requestData = this.buildSettingsPayload({ generate_api_key: true });
 
             const response = await this.api.makeRequest('/security', 'PUT', requestData);
 
             if (response.success) {
+                // The new key belongs only to this committed generation
+                if (response.settings_version) {
+                    this.currentSettings.settings_version = response.settings_version;
+                }
+
                 // Store the newly generated API key temporarily for the modal
                 const newApiKey = response.api_key;
 
@@ -339,8 +359,11 @@ export class SecurityComponent {
                 showToast(response.message || 'Failed to generate API key', 'error');
             }
         } catch (error) {
+            if (await this.handleConflict(error)) {
+                return;
+            }
             console.error('Failed to generate API key:', error);
-            showToast('Failed to generate API key', 'error');
+            showToast(error?.data?.message || 'Failed to generate API key', 'error');
         }
     }
 
@@ -350,28 +373,15 @@ export class SecurityComponent {
         }
 
         try {
-            // Get current form values to send complete request
-            const method = document.getElementById('auth-method').value;
-            const allowLocalCheckbox = document.getElementById('allow-local');
-            const allowLocalIps = allowLocalCheckbox && allowLocalCheckbox.checked;
-            const trustedProxiesTextarea = document.getElementById('trusted-proxies');
-            const trustedProxies = trustedProxiesTextarea ? trustedProxiesTextarea.value.split('\n').map(line => line.trim()).filter(line => line) : [];
-            const username = document.getElementById('username')?.value.trim() || '';
-            const password = document.getElementById('password')?.value || '';
-
-            const requestData = {
-                enabled: method !== 'none',
-                method: method,
-                bypass_auth_for_local: allowLocalIps,
-                trusted_proxies: trustedProxies,
-                username: username,
-                password: password,
-                clear_api_key: true
-            };
+            const requestData = this.buildSettingsPayload({ clear_api_key: true });
 
             const response = await this.api.makeRequest('/security', 'PUT', requestData);
 
             if (response.success) {
+                if (response.settings_version) {
+                    this.currentSettings.settings_version = response.settings_version;
+                }
+
                 // Clear the API key state
                 this.hasApiKey = false;
 
@@ -384,8 +394,11 @@ export class SecurityComponent {
                 showToast(response.message || 'Failed to clear API key', 'error');
             }
         } catch (error) {
+            if (await this.handleConflict(error)) {
+                return;
+            }
             console.error('Failed to clear API key:', error);
-            showToast('Failed to clear API key', 'error');
+            showToast(error?.data?.message || 'Failed to clear API key', 'error');
         }
     }
 
@@ -535,24 +548,18 @@ export class SecurityComponent {
                 }
             }
 
-            // Prepare request data
-            const requestData = {
-                enabled: method !== 'none',
-                method: method,
-                bypass_auth_for_local: allowLocalIps,
-                trusted_proxies: trustedProxies,
-                username: username,
-                password: password,
-                generate_api_key: false
-            };
+            // Prepare request data, pinning the generation loaded from the server
+            const requestData = this.buildSettingsPayload();
 
             // Make API request
             const response = await this.api.makeRequest('/security', 'PUT', requestData);
 
             if (response.success) {
-                showToast('Security settings saved successfully', 'success');
+                showToast(response.message === 'No changes to save'
+                    ? response.message
+                    : 'Security settings saved successfully', response.message === 'No changes to save' ? 'info' : 'success');
 
-                // Update current settings
+                // Update current settings, advancing to the committed generation
                 this.currentSettings = {
                     enabled: method !== 'none',
                     method: method,
@@ -560,7 +567,8 @@ export class SecurityComponent {
                     trusted_proxies: trustedProxies,
                     username: username,
                     password_hash: password ? '***' : this.currentSettings.password_hash,
-                    api_key: this.currentSettings.api_key
+                    api_key: this.currentSettings.api_key,
+                    settings_version: response.settings_version || this.currentSettings.settings_version || ''
                 };
 
                 // Clear password fields
@@ -573,8 +581,11 @@ export class SecurityComponent {
             }
 
         } catch (error) {
+            if (await this.handleConflict(error)) {
+                return;
+            }
             console.error('Failed to save security settings:', error);
-            showToast('Failed to save security settings', 'error');
+            showToast(error?.data?.message || 'Failed to save security settings', 'error');
         }
     }
 
